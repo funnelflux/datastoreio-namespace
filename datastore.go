@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/datastore"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
@@ -47,6 +48,51 @@ const (
 	scatterPropertyName = "__scatter__"
 )
 
+// FilterValueType controls how Filter.Value is interpreted before building the datastore query.
+type FilterValueType string
+
+const (
+	FilterValueTypeString    FilterValueType = "string"
+	FilterValueTypeInt       FilterValueType = "int"
+	FilterValueTypeFloat     FilterValueType = "float"
+	FilterValueTypeBool      FilterValueType = "bool"
+	FilterValueTypeTimestamp FilterValueType = "timestamp"
+)
+
+// Filter represents a datastore property filter that is applied to each shard query.
+type Filter struct {
+	Field    string          `json:"field"`
+	Operator string          `json:"operator"`
+	Value    string          `json:"value"`
+	Type     FilterValueType `json:"type"`
+}
+
+type readConfig struct {
+	filters []Filter
+}
+
+// ReadOption customizes the Read helper.
+type ReadOption func(*readConfig)
+
+func newReadConfig(opts ...ReadOption) readConfig {
+	cfg := readConfig{}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(&cfg)
+	}
+	return cfg
+}
+
+// WithFilters attaches one or more property filters to the datastore query.
+func WithFilters(filters ...Filter) ReadOption {
+	copied := append([]Filter(nil), filters...)
+	return func(cfg *readConfig) {
+		cfg.filters = append(cfg.filters, copied...)
+	}
+}
+
 func init() {
 	beam.RegisterType(reflect.TypeOf((*queryFn)(nil)).Elem())
 	beam.RegisterType(reflect.TypeOf((*splitQueryFn)(nil)).Elem())
@@ -54,18 +100,20 @@ func init() {
 
 // Read reads all rows from the given kind within the provided namespace.
 // The kind must have a schema compatible with the given type, t.
-func Read(s beam.Scope, project, namespace, kind string, shards int, t reflect.Type, typeKey string) beam.PCollection {
+// Optional ReadOptions can be supplied to narrow the query.
+func Read(s beam.Scope, project, namespace, kind string, shards int, t reflect.Type, typeKey string, opts ...ReadOption) beam.PCollection {
 	s = s.Scope("ledger.datastore.Read")
+	cfg := newReadConfig(opts...)
 	// for portable runner consideration, set newClient to nil for now
 	// which will be initialized in DoFn's Setup() method
-	return query(s, project, namespace, kind, shards, t, typeKey, nil)
+	return query(s, project, namespace, kind, shards, t, typeKey, cfg, nil)
 }
 
 func datastoreNewClient(ctx context.Context, projectID string, opts ...option.ClientOption) (clientType, error) {
 	return datastore.NewClient(ctx, projectID, opts...)
 }
 
-func query(s beam.Scope, project, namespace, kind string, shards int, t reflect.Type, typeKey string, newClient newClientFuncType) beam.PCollection {
+func query(s beam.Scope, project, namespace, kind string, shards int, t reflect.Type, typeKey string, cfg readConfig, newClient newClientFuncType) beam.PCollection {
 	imp := beam.Impulse(s)
 	ex := beam.ParDo(s, &splitQueryFn{
 		Project:       project,
@@ -80,6 +128,7 @@ func query(s beam.Scope, project, namespace, kind string, shards int, t reflect.
 		Namespace:     namespace,
 		Kind:          kind,
 		Type:          typeKey,
+		Filters:       cfg.filters,
 		newClientFunc: newClient,
 	}, g, beam.TypeDefinition{Var: beam.XType, T: t})
 }
@@ -218,7 +267,9 @@ type queryFn struct {
 	// Kind is the datastore kind
 	Kind string `json:"kind"`
 	// Type is the name of the global schema type
-	Type          string `json:"type"`
+	Type string `json:"type"`
+	// Filters are optional datastore property filters
+	Filters       []Filter `json:"filters"`
 	newClientFunc newClientFuncType
 }
 
@@ -261,6 +312,14 @@ func (s *queryFn) ProcessElement(ctx context.Context, _ string, v func(*string) 
 		dq = dq.Filter("__key__ <", q.End)
 	}
 
+	if len(s.Filters) > 0 {
+		var err error
+		dq, err = applyFilters(dq, s.Filters)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Run Query
 	iter := client.Run(ctx, dq)
 	for {
@@ -282,4 +341,96 @@ func (s *queryFn) ProcessElement(ctx context.Context, _ string, v func(*string) 
 		emit(reflect.ValueOf(val).Elem().Interface()) // emit(*val)
 	}
 	return nil
+}
+
+var validOperators = map[string]struct{}{
+	"=":  {},
+	">":  {},
+	"<":  {},
+	">=": {},
+	"<=": {},
+}
+
+var timestampLayouts = []string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02 15:04:05",
+	"2006-01-02",
+}
+
+func applyFilters(q *datastore.Query, filters []Filter) (*datastore.Query, error) {
+	dq := q
+	for _, filter := range filters {
+		expr, value, err := filter.toDatastoreFilter()
+		if err != nil {
+			return nil, err
+		}
+		dq = dq.Filter(expr, value)
+	}
+	return dq, nil
+}
+
+func (f Filter) toDatastoreFilter() (string, interface{}, error) {
+	field := strings.TrimSpace(f.Field)
+	if field == "" {
+		return "", nil, fmt.Errorf("datastoreio: filter requires a field name")
+	}
+
+	op := strings.TrimSpace(f.Operator)
+	if op == "" {
+		op = "="
+	}
+	if _, ok := validOperators[op]; !ok {
+		return "", nil, fmt.Errorf("datastoreio: unsupported operator %q for field %q", op, field)
+	}
+
+	value, err := f.parseValue()
+	if err != nil {
+		return "", nil, fmt.Errorf("datastoreio: field %q: %w", field, err)
+	}
+
+	return fmt.Sprintf("%s %s", field, op), value, nil
+}
+
+func (f Filter) parseValue() (interface{}, error) {
+	value := strings.TrimSpace(f.Value)
+	switch f.Type {
+	case "", FilterValueTypeString:
+		return value, nil
+	case FilterValueTypeInt:
+		v, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse int: %w", err)
+		}
+		return v, nil
+	case FilterValueTypeFloat:
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse float: %w", err)
+		}
+		return v, nil
+	case FilterValueTypeBool:
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf("parse bool: %w", err)
+		}
+		return v, nil
+	case FilterValueTypeTimestamp:
+		ts, err := parseTimestamp(value)
+		if err != nil {
+			return nil, err
+		}
+		return ts, nil
+	default:
+		return nil, fmt.Errorf("unsupported type %q", f.Type)
+	}
+}
+
+func parseTimestamp(value string) (time.Time, error) {
+	for _, layout := range timestampLayouts {
+		if ts, err := time.Parse(layout, value); err == nil {
+			return ts, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("parse timestamp %q: unsupported format", value)
 }
